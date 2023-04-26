@@ -1,0 +1,4 @@
+User-agent: *
+Disallow: /assets/
+Allow: /
+Sitemap: https://adm244.github.io/sitemap.xml

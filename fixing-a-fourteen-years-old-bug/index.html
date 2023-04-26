@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="HandheldFriendly" content="True">
+    <meta name="viewport" content="width=device-width,initial-scale=-1">
+    <meta name="referrer" content="no-referrer-when-downgrade">
+
+    <title>A Stroke of Fate: Fixing a fourteen years old bug</title>
+
+    <link rel="apple-touch-icon" sizes="180x180" href="https://adm244.github.io/assets/icons/favicon_180x180.png">
+    <link rel="icon" type="image/png" sizes="32x32" href="https://adm244.github.io/assets/icons/favicon_32x32.png">
+    <link rel="icon" type="image/png" sizes="16x16" href="https://adm244.github.io/assets/icons/favicon_16x16.png">
+    <link rel="manifest" href="https://adm244.github.io/assets/icons/site.webmanifest">
+    <link rel="shortcut icon" href="https://adm244.github.io/favicon.ico">
+
+    <link rel="stylesheet" href="https://adm244.github.io/fonts.css">
+    <link rel="stylesheet" href="https://adm244.github.io/main.css">
+
+    <link rel="alternate" type="application/atom+xml" title="RSS" href="https://adm244.github.io/atom.xml">
+</head>
+<body>
+    <a class="skip-main" href="#main">Skip to content</a>
+    <div class="container">
+        <header class="main-header">
+            <span class="main-header-text">
+                <a class="link-gray" href="https://adm244.github.io">AdM244 blog</a>
+            </span>
+            <nav class="main-header-text"><a class="link-gray" href="https://github.com/adm244">GitHub</a></nav>
+        </header>
+        <main id="main" tabindex="-1">
+
+<article class="post">
+    <header>
+        <h1>A Stroke of Fate: Fixing a fourteen years old bug</h1>
+        <span>23 minutes to read</span>
+    </header>
+    <section class="content">
+        <p>As many other old games the one we’re going to look at here doesn’t run well on Windows 10. In fact, it becomes unplayable after a certain part. All because of a critical scripting error that’s been there since day one, but only surfaced many years later. Finding and fixing this bug involved writing disassembler and assembler for Wintermute Engine scripts.</p>
+<blockquote>
+<p>Download fix: <a href="/fixing-a-fourteen-years-old-bug/shake.script">shake.script</a></p>
+</blockquote>
+<p>To install just copy <code>shake.script</code> file into “<code>&lt;game_root&gt;/scenes/bunker</code>” overwriting existing one (make a backup just in case).</p>
+<span id="continue-reading"></span>
+<h2 id="the-front-end-of-a-problem">The “front-end” of a problem<a class="heading-anchor" href="#the-front-end-of-a-problem" aria-label="Anchor link for: the-front-end-of-a-problem">&#128279;</a></h2>
+<p>According to a visual appearance game crashes some undetermined time after entering a bunker either with a “pure virtual function call” exception message or with no message at all. This suggests that potentially there are multiple (and maybe unrelated) problems.</p>
+<figure >
+  <a href="/fixing-a-fourteen-years-old-bug/game_purecall_msgbox.png">
+    <img src="/fixing-a-fourteen-years-old-bug/game_purecall_msgbox.png" alt="Game exception messagebox">
+  </a>
+  <figcaption><p>A “pure virtual function call” message</p>
+</figcaption>
+</figure>
+<p>Already it gives us good initial breaking points for debugging.</p>
+<h2 id="debugging-the-issue">Debugging the issue<a class="heading-anchor" href="#debugging-the-issue" aria-label="Anchor link for: debugging-the-issue">&#128279;</a></h2>
+<p>Hooking up a debugger that’s able to handle a low-level code (I’ll be using x32dbg — a version of <a rel="noreferrer" href="https://x64dbg.com/">x64dbg</a> to debug 32-bit applications) to the running game revealed an instruction that was causing an exception:</p>
+<figure >
+  <a href="/fixing-a-fourteen-years-old-bug/x64dbg_crash_point.png">
+    <img src="/fixing-a-fourteen-years-old-bug/x64dbg_crash_point.png" alt="x64dbg disassembly window">
+  </a>
+  <figcaption><p>Instruction causing game to crash</p>
+</figcaption>
+</figure>
+<p>In both cases it was an indirect call into a virtual function through a virtual functions table (C++ virtual method call). Sometimes call address contained a jump to <a rel="noreferrer" href="https://web.archive.org/web/20230410095050/https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/purecall?view=msvc-170"><code>_purecall</code></a> and sometimes garbage (in my case it was just zero, resulting in a <em>memory access violation</em> also known as <em><abbr title="Segmentation Fault">segfault</abbr></em>).</p>
+<p>Further analysis gave information that a caller is probably a function executing virtual machine instructions. A <em>class name</em> of object passed into it as “this” pointer is <code>CScScript</code> (acquired through <a rel="noreferrer" href="https://web.archive.org/web/20221205051639/http://www.openrce.org/articles/full_view/23">RTTI</a>), it has large <em>switch-case</em> statement and error messages like <code>&quot;Script stack corruption detected &lt;...&gt;&quot;</code> and <code>&quot;Fatal: Invalid instruction &lt;...&gt;&quot;</code> nearby. Checking <a rel="noreferrer" href="https://archive.org/details/wintermute_engine">WMEs source code</a> confirmed it.</p>
+<p>It was a <code>CScScript::ExecuteInstruction</code> function and VM instruction in question is <code>II_CALL_BY_EXP</code>. Game crashed attempting to call <code>CanHandleMethod</code> virtual function on a <code>VAL_NATIVE</code> type value pointed to by <code>CScValue</code> object popped from a script stack:</p>
+<pre data-lang="c++" style="background-color:#ffffff;color:#202020;" class="language-c++ "><code class="language-c++" data-lang="c++"><span>case II_CALL_BY_EXP: {
+</span><span>  </span><span style="color:#555555;">// push var
+</span><span>  </span><span style="color:#555555;">// push string
+</span><span>  str = m_Stack-&gt;Pop()-&gt;GetString();
+</span><span>  char* MethodName = new char[strlen(str)+1];
+</span><span>  strcpy(MethodName, str);
+</span><span>
+</span><span>  CScValue* var = m_Stack-&gt;Pop();
+</span><mark style="background-color:#cccccc;"><span>  if(var-&gt;m_Type==VAL_VARIABLE_REF) var = var-&gt;m_ValRef;
+</span></mark><mark style="background-color:#cccccc;"><span>
+</span></mark><span>  HRESULT res = E_FAIL;
+</span><span>  </span><span style="color:#555555;">// &lt;...&gt;
+</span><span>  if(FAILED(res)){
+</span><span>    </span><span style="color:#555555;">// Crash caused by an attempt to call &quot;CanHandleMethod&quot;
+</span><span>    </span><span style="color:#555555;">// through invalid vftable
+</span><mark style="background-color:#cccccc;"><span>    if(var-&gt;IsNative() &amp;&amp; var-&gt;GetNative()-&gt;CanHandleMethod(MethodName)){
+</span></mark><span>      </span><span style="color:#555555;">// &lt;...&gt;
+</span><span>    } else{
+</span><span>      </span><span style="color:#555555;">// &lt;...&gt;
+</span><span>    }
+</span><span>  }
+</span><span>  delete [] MethodName;
+</span><span>}
+</span><span>break;
+</span><span>
+</span><span style="color:#555555;">// &lt;...&gt;
+</span><span>
+</span><span>bool CScValue::IsNative()
+</span><span>{
+</span><span>  if(m_Type==VAL_VARIABLE_REF) return m_ValRef-&gt;IsNative();
+</span><span>  return (m_Type == VAL_NATIVE);
+</span><span>}
+</span><span>
+</span><span>CBScriptable* CScValue::GetNative()
+</span><span>{
+</span><span>  if(m_Type==VAL_VARIABLE_REF) return m_ValRef-&gt;GetNative();
+</span><mark style="background-color:#cccccc;"><span>  if(m_Type==VAL_NATIVE) return m_ValNative;
+</span></mark><span>  else return NULL;
+</span><span>}
+</span></code></pre>
+<p>It appears that this “native value” <code><var>m_ValNative</var></code> is getting corrupted somehow. What’s interesting here is that it doesn’t seem to be the case on OSes before Windows 8. Testing on my Windows 7 machine proved it to be true. No crashes there. This suggests the problem is most likely related to <em>dynamically linked libraries</em> (i.e. <abbr title="Dynamically Linked Library">DLL</abbr>s) that comes outside of game folder — these might be of various versions and behave differently.</p>
+<p>The next logical step is to figure out how this “native value” is created and pushed on stack. For this we would have to <em>disassemble</em> a script that contains this problematic <code>II_CALL_BY_EXP</code> instruction, therefore locate and extract it first.</p>
+<h2 id="dumping-a-script-file">Dumping a script file<a class="heading-anchor" href="#dumping-a-script-file" aria-label="Anchor link for: dumping-a-script-file">&#128279;</a></h2>
+<p>Knowing that we’re in <code>CScScript</code> member function we can extract its fields through “this” pointer which is stored in <code>ebp</code> register (how peculiar). Referencing the source code it’s easy to figure out offsets of specific class members:</p>
+<figure >
+  <a href="/fixing-a-fourteen-years-old-bug/x64dbg_cscsript_dump_anotated.png">
+    <img src="/fixing-a-fourteen-years-old-bug/x64dbg_cscsript_dump_anotated.png" alt="x64dbg memory dump window">
+  </a>
+  <figcaption><p><code>CScScript</code> annotated memory dump</p>
+</figcaption>
+</figure>
+<p>The <code><var>m_Stack</var></code> contains a pointer to script stack object, <code><var>m_CurrentLine</var></code> is the current source code line set by <code>II_DBG_LINE</code> instruction, <code><var>m_IP</var></code> is an offset of currently executing instruction, <code><var>m_BufferSize</var></code> is the size of a buffer that stores a script file, <code><var>m_Buffer</var></code> contains an entire script file and <code><var>m_Filename</var></code> is the script file name (also stored in a script file).</p>
+<p>Filename of a script we’re interested in is <code>scenes\bunker\shake.script</code>. Problematic instruction offset within a script file is <code>00002B37</code>. Dumping in this case is done by simply reading <code><var>m_BufferSize</var></code> bytes at <code><var>m_Buffer</var></code> address and storing it in a file on disk.</p>
+<h2 id="looking-at-the-script-file">Looking at the script file<a class="heading-anchor" href="#looking-at-the-script-file" aria-label="Anchor link for: looking-at-the-script-file">&#128279;</a></h2>
+<p>Now that we have extracted a possibly buggy script file it’s time to look what’s going on inside. We need a disassembler for that. Unable to find existing <abbr title="Wintermute Engine">WME</abbr> script disassemblers it was time to write one.</p>
+<h3 id="basics-of-wme-virtual-machine">Basics of WME virtual machine<a class="heading-anchor" href="#basics-of-wme-virtual-machine" aria-label="Anchor link for: basics-of-wme-virtual-machine">&#128279;</a></h3>
+<p>Wintermute’s virtual machine is stack based, there are no registers that can be directly accessed. Stack grows in a positive direction starting from <code>-1</code> initial value, thus top of a stack (if stack is not empty) always points to a valid value. There are 4 separate stacks: <code>CallStack</code>, <code>ThisStack</code>, <code>ScopeStack</code> and normal <code>Stack</code>.</p>
+<p><code>CallStack</code> is used in a local call mechanism, it stores a return address that points past a call instruction. <code>ThisStack</code> stores “this” pointers for member function calls. <code>ScopeStack</code> contains <code>NULL</code> values that are used as local variables containers (through <code>CScValue</code> properties mechanism). And <code>Stack</code> is the main script stack that is general purpose.</p>
+<p><abbr title="Operation Code">Opcode</abbr> size is fixed, its size is 4 bytes (<code>DWORD</code> sized). Each instruction consists of an <em><abbr title="Operation Code">opcode</abbr></em> and an optional <em>operand</em> with variable size depending on its type. There are total of 8 types defined for <code>CScValue</code>’s, but only 3 of them are technically used for operands: <code>integer</code>, <code>double</code> and <code>string</code>. Depending on instruction, interpretation of <code>integer</code> value may change, for example, it can also be <code>boolean</code>, an index into symbols table or code offset.</p>
+<p><code>Integer</code> type is a 32-bit integer, <code>double</code> is 64-bit floating-point value and <code>string</code> is a variable sized null-terminated one-byte characters array (<code>cstring</code>).</p>
+<h4 id="instructions">Instructions<a class="heading-anchor" href="#instructions" aria-label="Anchor link for: instructions">&#128279;</a></h4>
+<p>There are 47 instructions defined:</p>
+<pre style="background-color:#ffffff;color:#202020;"><code><span>+--------+--------+--------------------------+----------------+
+</span><span>| NUMBER | OPCODE |         MNEMONIC         |     OPERAND    |
+</span><span>+--------+--------+--------------------------+----------------+
+</span><span>|   01   |  0x00  |  &quot;DEF_VAR&quot;               |  Symbol Index  |
+</span><span>|   02   |  0x01  |  &quot;DEF_GLOB_VAR&quot;          |  Symbol Index  |
+</span><span>|   03   |  0x02  |  &quot;RET&quot;                   |      None      |
+</span><span>|   04   |  0x03  |  &quot;RET_EVENT&quot;             |      None      |
+</span><span>|   05   |  0x04  |  &quot;CALL&quot;                  |   Code Offset  |
+</span><span>|   06   |  0x05  |  &quot;CALL_BY_EXP&quot;           |      None      |
+</span><span>|   07   |  0x06  |  &quot;EXTERNAL_CALL&quot;         |  Symbol Index  |
+</span><span>|   08   |  0x07  |  &quot;SCOPE&quot;                 |      None      |
+</span><span>|   09   |  0x08  |  &quot;CORRECT_STACK&quot;         |     Integer    |
+</span><span>|   10   |  0x09  |  &quot;CREATE_OBJECT&quot;         |      None      |
+</span><span>|   11   |  0x0A  |  &quot;POP_EMPTY&quot;             |      None      |
+</span><span>|   12   |  0x0B  |  &quot;PUSH_VAR&quot;              |  Symbol Index  |
+</span><span>|   13   |  0x0C  |  &quot;PUSH_VAR_REF&quot;          |  Symbol Index  |
+</span><span>|   14   |  0x0D  |  &quot;POP_VAR&quot;               |  Symbol Index  |
+</span><span>|   15   |  0x0E  |  &quot;PUSH_VAR_THIS&quot;         |      None      |
+</span><span>|   16   |  0x0F  |  &quot;PUSH_INT&quot;              |     Integer    |
+</span><span>|   17   |  0x10  |  &quot;PUSH_BOOL&quot;             |     Integer    |
+</span><span>|   18   |  0x11  |  &quot;PUSH_FLOAT&quot;            |     Double     |
+</span><span>|   19   |  0x12  |  &quot;PUSH_STRING&quot;           |     String     |
+</span><span>|   20   |  0x13  |  &quot;PUSH_NULL&quot;             |      None      |
+</span><span>|   21   |  0x14  |  &quot;PUSH_THIS_FROM_STACK&quot;  |      None      |
+</span><span>|   22   |  0x15  |  &quot;PUSH_THIS&quot;             |  Symbol Index  |
+</span><span>|   23   |  0x16  |  &quot;POP_THIS&quot;              |      None      |
+</span><span>|   24   |  0x17  |  &quot;PUSH_BY_EXP&quot;           |      None      |
+</span><span>|   25   |  0x18  |  &quot;POP_BY_EXP&quot;            |      None      |
+</span><span>|   26   |  0x19  |  &quot;JMP&quot;                   |   Code Offset  |
+</span><span>|   27   |  0x1A  |  &quot;JMP_FALSE&quot;             |   Code Offset  |
+</span><span>|   28   |  0x1B  |  &quot;ADD&quot;                   |      None      |
+</span><span>|   29   |  0x1C  |  &quot;SUB&quot;                   |      None      |
+</span><span>|   30   |  0x1D  |  &quot;MUL&quot;                   |      None      |
+</span><span>|   31   |  0x1E  |  &quot;DIV&quot;                   |      None      |
+</span><span>|   32   |  0x1F  |  &quot;MODULO&quot;                |      None      |
+</span><span>|   33   |  0x20  |  &quot;NOT&quot;                   |      None      |
+</span><span>|   34   |  0x21  |  &quot;AND&quot;                   |      None      |
+</span><span>|   35   |  0x22  |  &quot;OR&quot;                    |      None      |
+</span><span>|   36   |  0x23  |  &quot;CMP_EQ&quot;                |      None      |
+</span><span>|   37   |  0x24  |  &quot;CMP_NE&quot;                |      None      |
+</span><span>|   38   |  0x25  |  &quot;CMP_L&quot;                 |      None      |
+</span><span>|   39   |  0x26  |  &quot;CMP_G&quot;                 |      None      |
+</span><span>|   40   |  0x27  |  &quot;CMP_LE&quot;                |      None      |
+</span><span>|   41   |  0x28  |  &quot;CMP_GE&quot;                |      None      |
+</span><span>|   42   |  0x29  |  &quot;CMP_STRICT_EQ&quot;         |      None      |
+</span><span>|   43   |  0x2A  |  &quot;CMP_STRICT_NE&quot;         |      None      |
+</span><span>|   44   |  0x2B  |  &quot;DBG_LINE&quot;              |     Integer    |
+</span><span>|   45   |  0x2C  |  &quot;POP_REG1&quot;              |      None      |
+</span><span>|   46   |  0x2D  |  &quot;PUSH_REG1&quot;             |      None      |
+</span><span>|   47   |  0x2E  |  &quot;DEF_CONST_VAR&quot;         |  Symbol Index  |
+</span><span>+--------+--------+--------------------------+----------------+
+</span></code></pre>
+<p>What exactly each instruction does can be looked in <a rel="noreferrer" href="https://archive.org/details/wintermute_engine">WMEs source code</a> in <code>CScScript::ExecuteInstruction</code> function that is located in <code>ScScript.cpp</code> file.</p>
+<h4 id="global-and-local-scopes">Global and local scopes<a class="heading-anchor" href="#global-and-local-scopes" aria-label="Anchor link for: global-and-local-scopes">&#128279;</a></h4>
+<p>Instructions can be located either in a <em>global scope</em> or <em>local scope</em>. Global scope instructions are not a part of any local <code>function</code>, <code>event</code> or <code>method</code>, unlike local scope ones that do. There may be many local scopes, but only one global. Local scopes are nested inside a global scope and there are no restrictions on where they may be located. Local scope is defined like this:</p>
+<pre data-lang="Assembly WME" style="background-color:#ffffff;color:#202020;" class="language-Assembly WME "><code class="language-Assembly WME" data-lang="Assembly WME"><span style="color:#555555;">// &lt;global scope instructions&gt;
+</span><span>  JMP local_scope_end
+</span><span>  SCOPE
+</span><span style="color:#555555;">  // &lt;local scope instructions&gt;
+</span><span>  RET</span><span style="color:#555555;"> // or RET_EVENT
+</span><span>local_scope_end:
+</span><span style="color:#555555;">// &lt;global scope instructions&gt;
+</span></code></pre>
+<p>Basically, this means that a local <code>function</code>, <code>event</code> or <code>method</code> can be inserted anywhere in a global scope as long as it doesn’t overlap with another local scope. The global code will skip over those parts through an unconditional jump. Each scope <strong>must</strong> end with either <code>RET</code> or <code>RET_EVENT</code> instruction, otherwise it will attempt to execute code of other scopes or even past code section (which is obviously bad).</p>
+<h4 id="call-mechanism">Call mechanism<a class="heading-anchor" href="#call-mechanism" aria-label="Anchor link for: call-mechanism">&#128279;</a></h4>
+<p>There are 3 types of calls: <code>internal</code>, <code>external</code> and <code>member</code>. For each VM has specific instructions defined — <code>CALL</code>, <code>EXTERNAL_CALL</code> and <code>CALL_BY_EXP</code> respectively. All types pass parameters right-to-left through stack including parameters count. <em>Callee</em> later pops them from stack. Return value is always pushed on stack by <em>callee</em> (<code>event</code> function is the exception here). If it’s meant to have no return value then it pushes <code>NULL</code> and <em>caller</em> pops and discards it.</p>
+<p><code>Internal</code> call is used to call local functions – these are defined within the same script file. A typical call looks like this:</p>
+<pre data-lang="Assembly WME" style="background-color:#ffffff;color:#202020;" class="language-Assembly WME "><code class="language-Assembly WME" data-lang="Assembly WME"><span>  PUSH_INT 244
+</span><span>  PUSH_BOOL 1
+</span><span>  PUSH_FLOAT 0.244
+</span><span>  PUSH_STRING &quot;Hello, World!&quot;
+</span><span>  PUSH_INT 4</span><span style="color:#555555;"> // &lt;-- pushing parameters count
+</span><span>
+</span><span>  CALL InternalFunctionName
+</span><span>  POP_EMPTY</span><span style="color:#555555;"> // &lt;-- discard return value
+</span></code></pre>
+<p>A callee at <code>InternalFunctionName</code> offset would look something like this:</p>
+<blockquote>
+<p>Note the <code>CORRECT_STACK</code> instruction. It’s used for variable arguments support. More on that later.</p>
+</blockquote>
+<pre data-lang="Assembly WME" style="background-color:#ffffff;color:#202020;" class="language-Assembly WME "><code class="language-Assembly WME" data-lang="Assembly WME"><span>  JMP internal_function_end
+</span><span>
+</span><span>  SCOPE
+</span><span>  CORRECT_STACK 4
+</span><span style="color:#555555;">  // &lt;internal function defines&gt;
+</span><span style="color:#555555;">  // &lt;internal function statements&gt;
+</span><span>  PUSH_NULL</span><span style="color:#555555;"> // &lt;-- return value
+</span><span>  RET
+</span><span>
+</span><span>internal_function_end:
+</span></code></pre>
+<p><code>External</code> function call looks exactly the same as <code>internal</code> call, the only difference is call instruction that’s used:</p>
+<pre data-lang="Assembly WME" style="background-color:#ffffff;color:#202020;" class="language-Assembly WME "><code class="language-Assembly WME" data-lang="Assembly WME"><span>  PUSH_INT 0</span><span style="color:#555555;"> // &lt;-- pushing parameters count
+</span><span>  EXTERNAL_CALL ExternalFunctionName
+</span><span>  POP_VAR &quot;variableName&quot;</span><span style="color:#555555;"> // &lt;-- store return value in a variable
+</span></code></pre>
+<p><code>Member</code> call is similar, it only adds “this” pointer push to both <code>ThisStack</code> and <code>Stack</code> and a member function name, also <code>CALL_BY_EXP</code> is used as call instruction:</p>
+<pre data-lang="Assembly WME" style="background-color:#ffffff;color:#202020;" class="language-Assembly WME "><code class="language-Assembly WME" data-lang="Assembly WME"><span>  PUSH_THIS &quot;objectName&quot;</span><span style="color:#555555;"> // &lt;-- push &quot;this&quot; to ThisStack
+</span><span>
+</span><span>  PUSH_FLOAT 3.1415
+</span><span>  PUSH_INT 1</span><span style="color:#555555;"> // &lt;-- pushing parameters count
+</span><span>
+</span><span>  PUSH_VAR &quot;objectName&quot;</span><span style="color:#555555;"> // &lt;-- push &quot;this&quot; to Stack
+</span><span>  PUSH_STRING &quot;functionName&quot;
+</span><span>  CALL_BY_EXP
+</span><span>  POP_EMPTY</span><span style="color:#555555;"> // &lt;-- discard return value
+</span><span>
+</span><span>  POP_THIS</span><span style="color:#555555;"> // &lt;-- pop &quot;this&quot; from ThisStack
+</span></code></pre>
+<blockquote>
+<p>So, if game crashes executing <code>CALL_BY_EXP</code> instruction because of invalid <em>vftable</em> this means that an object pushed by <code>PUSH_VAR</code> is invalid.</p>
+</blockquote>
+<p>Variable parameters count (<code>varargs</code>) is kind of supported, but it’s not what you’d expect it to be. Its implementation depends on <code>CORRECT_STACK</code> instruction. It takes parameters count from stack and compares it to <em>expected</em> number. If there are too many parameters it removes them from stack (starting from the ones pushed earlier) and if there’s too little — <code>NULL</code> values are inserted to match <em>expected</em> parameters count. So it’s possible to pass <strong>less</strong> parameters to a function than it expects (similar to <a rel="noreferrer" href="https://en.cppreference.com/w/cpp/language/default_arguments">default arguments</a> in C++ or <a rel="noreferrer" href="https://web.archive.org/web/20230327174404/https://learn.microsoft.com/en-us/dotnet/csharp/programming-guide/classes-and-structs/named-and-optional-arguments#optional-arguments">optional arguments</a> in C# but with value always being <code>NULL</code>), but passing <strong>more</strong> won’t work since everything above <em>expected</em> parameters count will be removed from stack. This means a classic <code>vararg</code> usage like <code>printf(fmt, ...)</code> is not supported.</p>
+<h3 id="analyzing-script-disassembly">Analyzing script disassembly<a class="heading-anchor" href="#analyzing-script-disassembly" aria-label="Anchor link for: analyzing-script-disassembly">&#128279;</a></h3>
+<p>Now that we know the basics of Wintermute’s virtual machine, we can read and analyze <code>shake.script</code> disassembly. At this point we already know that we need to figure out what object is being passed as “this” pointer into a <code>member</code> call right before <code>00002B37</code> address (relative to code section that would be <code>00002AFC</code>) and where it comes from. We also should keep an eye on anything suspicious that can potentially corrupt this object.</p>
+<p>Skipping most of irrelevant parts we end up with this:</p>
+<blockquote>
+<p>See <a href="/fixing-a-fourteen-years-old-bug/shake.asm">shake.asm</a> for full disassembly.</p>
+</blockquote>
+<pre data-lang="Assembly WME" style="background-color:#ffffff;color:#202020;" class="language-Assembly WME "><code class="language-Assembly WME" data-lang="Assembly WME"><span style="color:#555555;">/*  &lt;....&gt;  */
+</span><span style="color:#555555;">/* 0000275F */    </span><span>DBG_LINE 3
+</span><span style="color:#555555;">/* 00002767 */    </span><span>DEF_VAR &quot;e&quot;
+</span><span style="color:#555555;">/* 0000276F */    </span><span>PUSH_THIS &quot;Scene&quot;
+</span><span style="color:#555555;">/* 00002777 */    </span><span>PUSH_STRING &quot;scenes\spr\bricks1.entity&quot;
+</span><span style="color:#555555;">/* 00002795 */    </span><span>PUSH_INT 1
+</span><span style="color:#555555;">/* 0000279D */    </span><span>PUSH_VAR &quot;Scene&quot;
+</span><span style="color:#555555;">/* 000027A5 */    </span><span>PUSH_STRING &quot;LoadEntity&quot;
+</span><span style="color:#555555;">/* 000027B4 */    </span><span>CALL_BY_EXP
+</span><span style="color:#555555;">/* 000027B8 */    </span><span>POP_THIS
+</span><span style="color:#555555;">/* 000027BC */    </span><span>POP_VAR &quot;e&quot;
+</span><span style="color:#555555;">/*  &lt;....&gt;  */
+</span><span style="color:#555555;">/* 00002860 */    </span><span>DBG_LINE 7
+</span><span style="color:#555555;">/* 00002868 */    </span><span>DEF_VAR &quot;s&quot;
+</span><span style="color:#555555;">/* 00002870 */    </span><span>PUSH_THIS &quot;e&quot;
+</span><span style="color:#555555;">/* 00002878 */    </span><span>PUSH_INT 0
+</span><span style="color:#555555;">/* 00002880 */    </span><span>PUSH_VAR &quot;e&quot;
+</span><span style="color:#555555;">/* 00002888 */    </span><span>PUSH_STRING &quot;GetSpriteObject&quot;
+</span><span style="color:#555555;">/* 0000289C */    </span><span>CALL_BY_EXP
+</span><span style="color:#555555;">/* 000028A0 */    </span><span>POP_THIS
+</span><span style="color:#555555;">/* 000028A4 */    </span><span>POP_VAR &quot;s&quot;
+</span><span style="color:#555555;">/*  &lt;....&gt;  */
+</span><span style="color:#555555;">/* 00002986 */    </span><span>DBG_LINE 19
+</span><span style="color:#555555;">/* 0000298E */    </span><span>PUSH_INT 1000
+</span><span style="color:#555555;">/* 00002996 */    </span><span>PUSH_INT 60
+</span><span style="color:#555555;">/* 0000299E */    </span><span>PUSH_INT 0
+</span><span style="color:#555555;">/* 000029A6 */    </span><span>PUSH_INT 2
+</span><span style="color:#555555;">/* 000029AE */    </span><span>EXTERNAL_CALL &quot;Random&quot;
+</span><span style="color:#555555;">/* 000029B6 */    </span><span>MUL
+</span><span style="color:#555555;">/* 000029BA */    </span><span>PUSH_INT 1
+</span><span style="color:#555555;">/* 000029C2 */    </span><span>EXTERNAL_CALL &quot;Sleep&quot;
+</span><span style="color:#555555;">/* 000029CA */    </span><span>POP_EMPTY
+</span><span>
+</span><span>label000029CE:</span><span style="color:#555555;"> ; 1 reference
+</span><span style="color:#555555;">/* 000029CE */    </span><span>DBG_LINE 20
+</span><span style="color:#555555;">/* 000029D6 */    </span><span>PUSH_VAR &quot;TRUE&quot;
+</span><span style="color:#555555;">/* 000029DE */    </span><span>JMP_FALSE label00002E82
+</span><span style="color:#555555;">/*  &lt;....&gt;  */
+</span><span style="color:#555555;">/* 00002A3A */    </span><span>DBG_LINE 22
+</span><span style="color:#555555;">/* 00002A42 */    </span><span>PUSH_THIS &quot;e&quot;
+</span><span style="color:#555555;">/* 00002A4A */    </span><span>PUSH_STRING &quot;scenes\spr\bricks&quot;
+</span><span style="color:#555555;">/* 00002A60 */    </span><span>PUSH_INT 2
+</span><span style="color:#555555;">/* 00002A68 */    </span><span>PUSH_INT 1
+</span><span style="color:#555555;">/* 00002A70 */    </span><span>PUSH_INT 2
+</span><span style="color:#555555;">/* 00002A78 */    </span><span>EXTERNAL_CALL &quot;Random&quot;
+</span><span style="color:#555555;">/* 00002A80 */    </span><span>PUSH_INT 1
+</span><span style="color:#555555;">/* 00002A88 */    </span><span>EXTERNAL_CALL &quot;ToString&quot;
+</span><span style="color:#555555;">/* 00002A90 */    </span><span>ADD
+</span><span style="color:#555555;">/* 00002A94 */    </span><span>PUSH_STRING &quot;.sprite&quot;
+</span><span style="color:#555555;">/* 00002AA0 */    </span><span>ADD
+</span><span style="color:#555555;">/* 00002AA4 */    </span><span>PUSH_INT 1
+</span><span style="color:#555555;">/* 00002AAC */    </span><span>PUSH_VAR &quot;e&quot;
+</span><span style="color:#555555;">/* 00002AB4 */    </span><span>PUSH_STRING &quot;SetSprite&quot;
+</span><span style="color:#555555;">/* 00002AC2 */    </span><span>CALL_BY_EXP
+</span><span style="color:#555555;">/* 00002AC6 */    </span><span>POP_EMPTY
+</span><span style="color:#555555;">/* 00002ACA */    </span><span>POP_THIS
+</span><span>
+</span><span style="color:#555555;">/* 00002ACE */    </span><span>DBG_LINE 23
+</span><span style="color:#555555;">/* 00002AD6 */    </span><span>PUSH_THIS &quot;s&quot;
+</span><span style="color:#555555;">/* 00002ADE */    </span><span>PUSH_INT 0
+</span><span style="color:#555555;">/* 00002AE6 */    </span><span>PUSH_VAR &quot;s&quot;
+</span><span style="color:#555555;">/* 00002AEE */    </span><span>PUSH_STRING &quot;Reset&quot;
+</span><span style="color:#555555;">/* 00002AF8 */    </span><span>CALL_BY_EXP</span><span style="color:#555555;"> // &lt;-- this call causes game to crash
+</span><mark style="background-color:#cccccc;"><span style="color:#555555;">/* 00002AFC */    </span><span>POP_EMPTY
+</span></mark><span style="color:#555555;">/* 00002B00 */    </span><span>POP_THIS
+</span><span style="color:#555555;">/*  &lt;....&gt;  */
+</span><span style="color:#555555;">/* 00002E2A */    </span><span>DBG_LINE 42
+</span><span style="color:#555555;">/* 00002E32 */    </span><span>PUSH_INT 1000
+</span><span style="color:#555555;">/* 00002E3A */    </span><span>PUSH_INT 60
+</span><span style="color:#555555;">/* 00002E42 */    </span><span>PUSH_INT 30
+</span><span style="color:#555555;">/* 00002E4A */    </span><span>PUSH_INT 2
+</span><span style="color:#555555;">/* 00002E52 */    </span><span>EXTERNAL_CALL &quot;Random&quot;
+</span><span style="color:#555555;">/* 00002E5A */    </span><span>MUL
+</span><span style="color:#555555;">/* 00002E5E */    </span><span>PUSH_INT 1
+</span><span style="color:#555555;">/* 00002E66 */    </span><span>EXTERNAL_CALL &quot;Sleep&quot;
+</span><span style="color:#555555;">/* 00002E6E */    </span><span>POP_EMPTY
+</span><span>
+</span><span style="color:#555555;">/* 00002E72 */    </span><span>DBG_LINE 43
+</span><span style="color:#555555;">/* 00002E7A */    </span><span>JMP label000029CE
+</span><span>
+</span><span>label00002E82:</span><span style="color:#555555;"> ; 1 reference
+</span><span style="color:#555555;">/* 00002E82 */    </span><span>DBG_LINE 1
+</span><span style="color:#555555;">/* 00002E8A */    </span><span>JMP label000032EF
+</span><span style="color:#555555;">/*  &lt;....&gt;  */
+</span></code></pre>
+<p>It might seem confusing and there’s a lot going on, but in reality it’s not doing much. If we manually decompile it to a high-level representation we will get something like this:</p>
+<blockquote>
+<p>See <a href="/fixing-a-fourteen-years-old-bug/shake.c">shake.c</a> for full decompilation.</p>
+</blockquote>
+<pre data-lang="C++" style="background-color:#ffffff;color:#202020;" class="language-C++ "><code class="language-C++" data-lang="C++"><span style="color:#555555;">// &lt;...&gt;
+</span><span>var e = Scene.LoadEntity(&quot;scenes\\spr\\bricks1.entity&quot;);
+</span><span style="color:#555555;">// &lt;...&gt;
+</span><span>var s = e.GetSpriteObject();
+</span><span style="color:#555555;">// &lt;...&gt;
+</span><span>Sleep(Random(0, 60) * 1000);
+</span><span>while (TRUE) {
+</span><span>  </span><span style="color:#555555;">// &lt;...&gt;
+</span><span>  e.SetSprite(&quot;scenes\\spr\\bricks&quot; + ToString(Random(1, 2)) + &quot;.sprite&quot;);
+</span><span>  s.Reset(); </span><span style="color:#555555;">// &lt;-- this call causes game to crash
+</span><span>  </span><span style="color:#555555;">// &lt;...&gt;
+</span><span>  Sleep(Random(30, 60) * 1000);
+</span><span>}
+</span><span style="color:#555555;">// &lt;...&gt;
+</span></code></pre>
+<p>Much better, right? And we can solve one mystery already. Namely, why the time it takes before crash is different each time. That’s because the script is <em>sleeping</em> (paused) for a random amount of time between 0 and 60 seconds (time is passed into <code>Sleep</code> function in milliseconds) before a call to a game crashing function happens.</p>
+<p>As for why it crashes, now we can clearly see that object that’s getting corrupted named “<code><var>s</var></code>” and it’s returned by <code>GetSpriteObject</code> method on previously loaded <code>entity</code>. We should verify that it returns a valid object and if it does, it means something in-between two calls corrupts it. That <code>SetSprite</code> method looks suspicious and has to be checked too as it might modify our “<code><var>s</var></code>” object. Let’s see what it does (it’s located in <code>src/engine_core/wme_ad/AdTalkHolder.cpp:96</code>):</p>
+<pre data-lang="C++" style="background-color:#ffffff;color:#202020;" class="language-C++ "><code class="language-C++" data-lang="C++"><span>if(strcmp(Name, &quot;SetSprite&quot;)==0){
+</span><span>  Stack-&gt;CorrectParams(1);
+</span><span>  CScValue* Val = Stack-&gt;Pop();
+</span><span>  </span><span style="color:#555555;">// &lt;...&gt;
+</span><mark style="background-color:#cccccc;"><span>  SAFE_DELETE(m_Sprite);
+</span></mark><span>  if(Val-&gt;IsNULL()) {
+</span><span>    </span><span style="color:#555555;">// &lt;...&gt;
+</span><span>  } else {
+</span><span>    char* Filename = Val-&gt;GetString();
+</span><mark style="background-color:#cccccc;"><span>    CBSprite* spr = new CBSprite(Game, this);
+</span></mark><span>    if(!spr || FAILED(spr-&gt;LoadFile(Filename))) {
+</span><span>      </span><span style="color:#555555;">// &lt;...&gt;
+</span><span>    } else {
+</span><mark style="background-color:#cccccc;"><span>      m_Sprite = spr;
+</span></mark><span>      </span><span style="color:#555555;">// &lt;...&gt;
+</span><span>    }
+</span><span>  }
+</span><span>  return S_OK;
+</span><span>}
+</span><span>
+</span><span style="color:#555555;">// SAFE_DELETE(m_Sprite) macro expanded:
+</span><span>if(m_Sprite) {
+</span><mark style="background-color:#cccccc;"><span>  delete m_Sprite;
+</span></mark><span>  m_Sprite = NULL;
+</span><span>} else 0
+</span></code></pre>
+<p>First it frees existing <code><var>m_Sprite</var></code> object by calling <code>delete</code> operator, then if a file name is provided (as a parameter into this function) a new <code>CBSprite</code> object is created and if it’s successfully loaded it’s stored back into <code><var>m_Sprite</var></code> variable which is a pointer to <code>CBSprite</code> object (i.e. <code>CBSprite *</code>).</p>
+<blockquote>
+<p>We’ve now learned that <code>SetSprite</code> function recreates <code>CBSprite</code> object and stores its pointer to <code><var>m_Sprite</var></code> variable.</p>
+</blockquote>
+<p>And this how <code>GetSpriteObject</code> is implemented:</p>
+<pre data-lang="C++" style="background-color:#ffffff;color:#202020;" class="language-C++ "><code class="language-C++" data-lang="C++"><span>else if(strcmp(Name, &quot;GetSpriteObject&quot;)==0){
+</span><span>  Stack-&gt;CorrectParams(0);
+</span><span>
+</span><span>  if(!m_Sprite) Stack-&gt;PushNULL();
+</span><mark style="background-color:#cccccc;"><span>  else Stack-&gt;PushNative(m_Sprite, true);
+</span></mark><span>  return S_OK;
+</span><span>}
+</span></code></pre>
+<p>It returns whatever is stored in <code><var>m_Sprite</var></code> (i.e. a pointer to <code>CBSprite</code>) or <code>NULL</code> if sprite is not initialized. We already know that by the time <code>GetSpriteObject</code> is called <code><var>m_Sprite</var></code> variable must’ve been initialized, otherwise we would’ve got a <code>VAL_NULL</code> value from stack, not <code>VAL_NATIVE</code>. Validness of a <code>CBSprite *</code> returned from <code>GetSpriteObject</code> is yet to be confirmed, meanwhile let’s take a look at how this object gets created. Function <code>Scene.LoadEntity</code> is our best place to start (located at <code>src/engine_core/wme_ad/AdScene.cpp:1643</code>):</p>
+<pre data-lang="C++" style="background-color:#ffffff;color:#202020;" class="language-C++ "><code class="language-C++" data-lang="C++"><span>else if(strcmp(Name, &quot;LoadEntity&quot;)==0){
+</span><span>  Stack-&gt;CorrectParams(1);
+</span><mark style="background-color:#cccccc;"><span>  CAdEntity* ent = new CAdEntity(Game);
+</span></mark><mark style="background-color:#cccccc;"><span>  if(ent &amp;&amp; SUCCEEDED(ent-&gt;LoadFile(Stack-&gt;Pop()-&gt;GetString()))) {
+</span></mark><span>    AddObject(ent);
+</span><span>    Stack-&gt;PushNative(ent, true);
+</span><span>  } else {
+</span><span>    SAFE_DELETE(ent);
+</span><span>    Stack-&gt;PushNULL();
+</span><span>  }
+</span><span>  return S_OK;
+</span><span>}
+</span></code></pre>
+<p>Cutting to the point, <code><var>m_Sprite</var></code> is being set to <code>NULL</code> at <code>CAdEntity</code> creation and actually created when loading <code>entity</code> from a file (if it has a sprite defined in it). This means that it should be valid.</p>
+<p>At this point we can be almost certain what’s causing the issue. Following <code>shake.script</code> logic it first loads <code>entity</code> from a file and saves a pointer to its sprite object into a variable “<code>s</code>”. Then, right before calling <code>Reset</code> method on it a call to <code>SetSprite</code> is made that recreates sprite and overrides <code><var>m_Sprite</var></code> variable. But “<code><var>s</var></code>” variable still has a pointer to an old object that’s been deleted, thus variable “<code><var>s</var></code>” is invalid now.</p>
+<p>In this case <abbr title="Wintermute Engine">WME</abbr> is trying to call <code>Reset</code> function on a <em>deleted</em> object. When object gets deleted by <code>delete</code> operator a <em>series of destructors</em> is called. One destructor for each object in the inheritance chain (in child-to-parent direction). Each destructor replaces a <em>vftable</em> pointer by the one that corresponds to its object. Once all destructors have been called the memory gets <em>deallocated</em>.</p>
+<blockquote>
+<p>Sure it’s a bit more complicated than this, but that’s enough to get the general idea.</p>
+</blockquote>
+<p>It happens that our <code>CBSprite</code> object’s root is an abstract class <code>CBBase</code> with pure virtual functions in its <em>vftable</em>. That’s where a “pure virtual function call” comes from. As for another crash with no message, it’s just because the memory previously occupied by <code>CBSprite</code> was allocated for something else and got overwritten in-between <code>SetSprite</code> and <code>Reset</code> calls.</p>
+<p>Now we have our theory, and it’s time to put it to the test…</p>
+<h2 id="dynamic-analysis">Dynamic analysis<a class="heading-anchor" href="#dynamic-analysis" aria-label="Anchor link for: dynamic-analysis">&#128279;</a></h2>
+<p>Running the game again with debugger attached there are a few things we need to confirm:</p>
+<ol>
+<li><code>CBSprite</code> object returned from <code>GetSpriteObject</code> is valid.</li>
+<li>Variable “<code><var>s</var></code>” contains valid pointer to <code>CBSprite</code>.</li>
+<li><code>SetSprite</code> method deletes existing <code>CBSprite</code> and allocates new one at different memory address.</li>
+<li><code>Reset</code> method is using now invalid pointer from “<code><var>s</var></code>” variable.</li>
+</ol>
+<p>Utilizing <a rel="noreferrer" href="https://help.x64dbg.com/en/latest/introduction/ConditionalBreakpoint.html">conditional breakpoints</a> it’s easy to break at the specific function call in the script we want to analyze. There are two breakpoints we have to put initially: at <code>ScCallMethod</code> when it’s about to call <code>GetSpriteObject</code> (at <code>0043C6A9</code>) and at <code>CanHandleMethod</code> with <code>Reset</code> method name (at <code>0043C5FA</code>).</p>
+<p>Conditional breakpoint for <code>GetSpriteObject</code> function (<code>0043C6A9</code>):</p>
+<pre style="background-color:#ffffff;color:#202020;"><code><span>strstr(utf8([ebp + 94]), &quot;shake.script&quot;) &amp;&amp;
+</span><span> streq(utf8([esp + C]), &quot;GetSpriteObject&quot;)
+</span></code></pre>
+<p>First part checks whether currently executing script has a <code>shake.script</code> substring in its file name and second part compares if <code>MethodName</code> argument into <code>ScCallMethod</code> is <code>GetSpriteObject</code>. Since arguments are passed on stack <code>[esp + C]</code> will return fourth argument. Register <code>ebp</code> contains pointer to <code>CScScript</code> object that has <code><var>m_Filename</var></code> pointer at offset <code>0x94</code>.</p>
+<blockquote>
+<p>To learn more about using conditional breakpoints see <a rel="noreferrer" href="https://help.x64dbg.com/en/latest/introduction/Expressions.html">Expressions</a> and <a rel="noreferrer" href="https://help.x64dbg.com/en/latest/introduction/Expression-functions.html">Expression Functions</a> parts of x64dbg documentation.</p>
+</blockquote>
+<p>This condition should be put in <em>Break Condition</em> field inside <em>Edit Breakpoint</em> window:</p>
+<figure >
+  <a href="/fixing-a-fourteen-years-old-bug/x64dbg_cbp_window_getspriteobject.png">
+    <img src="/fixing-a-fourteen-years-old-bug/x64dbg_cbp_window_getspriteobject.png" alt="x64dbg edit breakpoint window">
+  </a>
+  <figcaption><p>Conditional breakpoint</p>
+</figcaption>
+</figure>
+<p>Conditional breakpoint for <code>Reset</code> function (<code>0043C5FA</code>):</p>
+<pre style="background-color:#ffffff;color:#202020;"><code><span>strstr(utf8([ebp + 94]), &quot;shake.script&quot;) &amp;&amp; streq(utf8([esp]), &quot;Reset&quot;)
+</span></code></pre>
+<p>Now that’s everything is ready it’s time to enter bunker. On a loading screen we should hit our first breakpoint:</p>
+<figure >
+  <a href="/fixing-a-fourteen-years-old-bug/x64dbg_cbp_hit.png">
+    <img src="/fixing-a-fourteen-years-old-bug/x64dbg_cbp_hit.png" alt="x64dbg main window">
+  </a>
+  <figcaption><p>Conditional breakpoint is hit</p>
+</figcaption>
+</figure>
+<p>Now if we <em>step over</em> the <code>call edx</code> instruction (<code>F8</code>) we can verify whether <code>GetSpriteObject</code> returned a valid object. This returned value is stored on top of a stack, and we need to access and read its data. Here is a series of commands that will do this for us:</p>
+<pre data-lang="C++" style="background-color:#ffffff;color:#202020;" class="language-C++ "><code class="language-C++" data-lang="C++"><span style="color:#555555;">// Get script stack array pointer
+</span><span>$stack_ptr = [[ebp + 78] + 24]
+</span><span>
+</span><span style="color:#555555;">// Get m_SP value of script stack
+</span><span>$m_SP = [[ebp + 78] + 34]
+</span><span>
+</span><span style="color:#555555;">// Get native object pointer from a top stack CScValue
+</span><span>$obj = [[$stack_ptr + ($m_SP * 4)] + 2C]
+</span></code></pre>
+<p>Variable <code><var>$obj</var></code> should contain a pointer to <code>CBSprite</code> object if <code>GetSpriteObject</code> returned a valid value. It can be verified by reading a <em>class name</em> from RTTI:</p>
+<pre data-lang="C++" style="background-color:#ffffff;color:#202020;" class="language-C++ "><code class="language-C++" data-lang="C++"><span style="color:#555555;">// Get object class name from RTTI
+</span><span>utf8([[[$obj] - 4] + C] + 8)
+</span></code></pre>
+<p>This returns “<code>.?AVCBSprite@@</code>” — a mangled (<a rel="noreferrer" href="https://web.archive.org/web/20230328070122/https://learn.microsoft.com/en-us/cpp/build/reference/decorated-names?view=msvc-170">decorated</a>) class name which confirms that the object pointer is valid.</p>
+<blockquote>
+<p>Note that MSVC RTTI name mangling differs from non-RTTI. You can refer to <a rel="noreferrer" href="https://reverseengineering.stackexchange.com/questions/20516/how-can-i-demangle-the-name-in-an-rtti-type-descriptor">StackExchange topic</a> for demangling solutions.</p>
+</blockquote>
+<p>Before doing anything else let’s put a <em>hardware write dword</em> breakpoint at <code><var>$obj</var></code> memory address. This will make sure that if anything attempts to rewrite <code>CBSprite</code>’s <em>vftable</em> we’ll break right after an instruction that caused it. It should happen inside a destructor, more specifically <code>CBSprite</code> destructor and then all the parent objects destructors up to <code>CBBase</code>.</p>
+<p>Run the game again (<code>F9</code>). After some time between 0 and 60 seconds our hardware breakpoint should be hit inside <code>CBSprite</code> virtual destructor. Going up the <em>call stack</em> reveals that this destructor is called from <code>SetSprite</code> method. While we’re here put a breakpoint at <code>CBSprite</code>’s new operator’s memory allocation call at <code>004A19B4</code> to see later the returned address of a new object.</p>
+<p>Hit run again. We should immediately break at <code>CBScriptHolder</code> virtual destructor. Checking RTTI with the newly written <em>vftable</em> using “<code>utf8([[[$obj] - 4] + C] + 8)</code>” command shows “<code>.?AVCBScriptHolder@@</code>”, that’s correct. If we continue, the same command will show “<code>.?AVCBScriptable@@</code>” then “<code>.?AVCBNamedObject@@</code>” and finally “<code>.?AVCBBase@@</code>” — the root class of <code>CBSprite</code>.</p>
+<p>So far this confirms that our object is being deleted. If we continue program execution we’ll hit a breakpoint at the “new operator” called for <code>CBSprite</code> just before the memory is about to be allocated. After stepping over (<code>F8</code>) we compare <code><var>$obj</var></code> and <code><var>eax</var></code> values and confirm that they are different. Let’s save this new address:</p>
+<pre data-lang="C++" style="background-color:#ffffff;color:#202020;" class="language-C++ "><code class="language-C++" data-lang="C++"><span style="color:#555555;">// Store address of a new CBSprite object
+</span><span>$obj_new = eax
+</span></code></pre>
+<p>When we run game again a breakpoint at <code>Reset</code> method call is hit (because this is the next function to be executed in the script). Here we can finally confirm whether our theory is correct or not. Let’s update the value stored in the “<code><var>s</var></code>” variable: <code>$obj = [esi + 2C]</code> and compare it to <code><var>$obj_new</var></code>. They are different! Checking out a class name from the RTTI (with “<code>utf8([[[$obj] - 4] + C] + 8)</code>”) also confirms this is not the object we’d expect to see (i.e. with a class name “<code>.?AVCBSprite@@</code>”) passed into <code>Reset</code> method as “this” pointer. This confirms that variable “<code><var>s</var></code>” stores a <em>dangling pointer</em> after <code>SetSprite</code> has been called.</p>
+<blockquote>
+<p>For those of you still wondering why it doesn’t crash on Windows 7 the answer is simple — the pointer returned from a <em>new operator</em> is the same as the old one. Since memory allocation is done through a dynamically linked third-party library the behavior may change. But despite the fact it hasn’t crashed there’s no guarantee it won’t, it’s still a bug, and it should be fixed.</p>
+</blockquote>
+<p>If you hit run again the game will crash.</p>
+<h2 id="solving-the-issue">Solving the issue<a class="heading-anchor" href="#solving-the-issue" aria-label="Anchor link for: solving-the-issue">&#128279;</a></h2>
+<p>Now that we’ve established the invalid sprite object pointer is what’s causing the game to crash, we can think of a solution. So, instead of doing this:</p>
+<pre data-lang="C++" style="background-color:#ffffff;color:#202020;" class="language-C++ "><code class="language-C++" data-lang="C++"><span>var e = Scene.LoadEntity(&quot;scenes\\spr\\bricks1.entity&quot;);
+</span><mark style="background-color:#cccccc;"><span>var s = e.GetSpriteObject();
+</span></mark><span>
+</span><span>while (TRUE) {
+</span><span>  </span><span style="color:#555555;">// &lt;...&gt;
+</span><span>  e.SetSprite(&quot;scenes\\spr\\bricks&quot; + ToString(Random(1, 2)) + &quot;.sprite&quot;);
+</span><mark style="background-color:#cccccc;"><span>  s.Reset();
+</span></mark><span>  </span><span style="color:#555555;">// &lt;...&gt;
+</span><span>}
+</span></code></pre>
+<p>We should do this:</p>
+<pre data-lang="C++" style="background-color:#ffffff;color:#202020;" class="language-C++ "><code class="language-C++" data-lang="C++"><span>var e = Scene.LoadEntity(&quot;scenes\\spr\\bricks1.entity&quot;);
+</span><mark style="background-color:#cccccc;"><span>var s;
+</span></mark><span>
+</span><span>while (TRUE) {
+</span><span>  </span><span style="color:#555555;">// &lt;...&gt;
+</span><span>  e.SetSprite(&quot;scenes\\spr\\bricks&quot; + ToString(Random(1, 2)) + &quot;.sprite&quot;);
+</span><mark style="background-color:#cccccc;"><span>  s = e.GetSpriteObject();
+</span></mark><mark style="background-color:#cccccc;"><span>  s.Reset();
+</span></mark><span>  </span><span style="color:#555555;">// &lt;...&gt;
+</span><span>}
+</span></code></pre>
+<p>This way it is <em>guaranteed</em> that variable “<code><var>s</var></code>” will contain a valid pointer after <code>SetSprite</code> method invalidates the previous one (and it’s easy to implement). The <code>var</code> definition is left in the same place because it generates <code>DEF_VAR</code> instruction that initializes variable to <code>NULL</code> which is useless because it’s being rewritten right away. Besides, it’s <em>one instruction less</em> in a loop.</p>
+<blockquote>
+<p>Not like it matters much, but why not? I bet the very same mindset is what probably led to this bug in a first place…</p>
+</blockquote>
+<p>In assembly code it would look like this:</p>
+<pre data-lang="Assembly WME" style="background-color:#ffffff;color:#202020;" class="language-Assembly WME "><code class="language-Assembly WME" data-lang="Assembly WME"><span style="color:#555555;">/*  &lt;....&gt;  */
+</span><span style="color:#555555;">/* 0000275F */    </span><span>DBG_LINE 3
+</span><span style="color:#555555;">/* 00002767 */    </span><span>DEF_VAR &quot;e&quot;
+</span><span style="color:#555555;">/* 0000276F */    </span><span>PUSH_THIS &quot;Scene&quot;
+</span><span style="color:#555555;">/* 00002777 */    </span><span>PUSH_STRING &quot;scenes\spr\bricks1.entity&quot;
+</span><span style="color:#555555;">/* 00002795 */    </span><span>PUSH_INT 1
+</span><span style="color:#555555;">/* 0000279D */    </span><span>PUSH_VAR &quot;Scene&quot;
+</span><span style="color:#555555;">/* 000027A5 */    </span><span>PUSH_STRING &quot;LoadEntity&quot;
+</span><span style="color:#555555;">/* 000027B4 */    </span><span>CALL_BY_EXP
+</span><span style="color:#555555;">/* 000027B8 */    </span><span>POP_THIS
+</span><span style="color:#555555;">/* 000027BC */    </span><span>POP_VAR &quot;e&quot;
+</span><span style="color:#555555;">/*  &lt;....&gt;  */
+</span><mark style="background-color:#cccccc;"><span style="color:#555555;">/* 00002860 */    </span><span>DBG_LINE 7
+</span></mark><mark style="background-color:#cccccc;"><span style="color:#555555;">/* 00002868 */    </span><span>DEF_VAR &quot;s&quot;
+</span></mark><span style="color:#555555;">/*  &lt;....&gt;  */
+</span><span>label000029CE:</span><span style="color:#555555;"> ; 1 reference
+</span><span style="color:#555555;">/* 000029CE */    </span><span>DBG_LINE 20
+</span><span style="color:#555555;">/* 000029D6 */    </span><span>PUSH_VAR &quot;TRUE&quot;
+</span><span style="color:#555555;">/* 000029DE */    </span><span>JMP_FALSE label00002E82
+</span><span style="color:#555555;">/*  &lt;....&gt;  */
+</span><span style="color:#555555;">/* 00002A3A */    </span><span>DBG_LINE 22
+</span><span style="color:#555555;">/* 00002A42 */    </span><span>PUSH_THIS &quot;e&quot;
+</span><span style="color:#555555;">/* 00002A4A */    </span><span>PUSH_STRING &quot;scenes\spr\bricks&quot;
+</span><span style="color:#555555;">/* 00002A60 */    </span><span>PUSH_INT 2
+</span><span style="color:#555555;">/* 00002A68 */    </span><span>PUSH_INT 1
+</span><span style="color:#555555;">/* 00002A70 */    </span><span>PUSH_INT 2
+</span><span style="color:#555555;">/* 00002A78 */    </span><span>EXTERNAL_CALL &quot;Random&quot;
+</span><span style="color:#555555;">/* 00002A80 */    </span><span>PUSH_INT 1
+</span><span style="color:#555555;">/* 00002A88 */    </span><span>EXTERNAL_CALL &quot;ToString&quot;
+</span><span style="color:#555555;">/* 00002A90 */    </span><span>ADD
+</span><span style="color:#555555;">/* 00002A94 */    </span><span>PUSH_STRING &quot;.sprite&quot;
+</span><span style="color:#555555;">/* 00002AA0 */    </span><span>ADD
+</span><span style="color:#555555;">/* 00002AA4 */    </span><span>PUSH_INT 1
+</span><span style="color:#555555;">/* 00002AAC */    </span><span>PUSH_VAR &quot;e&quot;
+</span><span style="color:#555555;">/* 00002AB4 */    </span><span>PUSH_STRING &quot;SetSprite&quot;
+</span><span style="color:#555555;">/* 00002AC2 */    </span><span>CALL_BY_EXP
+</span><span style="color:#555555;">/* 00002AC6 */    </span><span>POP_EMPTY
+</span><span style="color:#555555;">/* 00002ACA */    </span><span>POP_THIS
+</span><span>
+</span><mark style="background-color:#cccccc;"><span>                  PUSH_THIS &quot;e&quot;
+</span></mark><mark style="background-color:#cccccc;"><span>                  PUSH_INT 0
+</span></mark><mark style="background-color:#cccccc;"><span>                  PUSH_VAR &quot;e&quot;
+</span></mark><mark style="background-color:#cccccc;"><span>                  PUSH_STRING &quot;GetSpriteObject&quot;
+</span></mark><mark style="background-color:#cccccc;"><span>                  CALL_BY_EXP
+</span></mark><mark style="background-color:#cccccc;"><span>                  POP_THIS
+</span></mark><mark style="background-color:#cccccc;"><span>                  POP_VAR &quot;s&quot;
+</span></mark><span>
+</span><span style="color:#555555;">/* 00002ACE */    </span><span>DBG_LINE 23
+</span><span style="color:#555555;">/* 00002AD6 */    </span><span>PUSH_THIS &quot;s&quot;
+</span><span style="color:#555555;">/* 00002ADE */    </span><span>PUSH_INT 0
+</span><span style="color:#555555;">/* 00002AE6 */    </span><span>PUSH_VAR &quot;s&quot;
+</span><span style="color:#555555;">/* 00002AEE */    </span><span>PUSH_STRING &quot;Reset&quot;
+</span><span style="color:#555555;">/* 00002AF8 */    </span><span>CALL_BY_EXP
+</span><span style="color:#555555;">/* 00002AFC */    </span><span>POP_EMPTY
+</span><span style="color:#555555;">/* 00002B00 */    </span><span>POP_THIS
+</span><span style="color:#555555;">/*  &lt;....&gt;  */
+</span><span style="color:#555555;">/* 00002E72 */    </span><span>DBG_LINE 43
+</span><span style="color:#555555;">/* 00002E7A */    </span><span>JMP label000029CE
+</span><span>
+</span><span>label00002E82:</span><span style="color:#555555;"> ; 1 reference
+</span><span style="color:#555555;">/* 00002E82 */    </span><span>DBG_LINE 1
+</span><span style="color:#555555;">/* 00002E8A */    </span><span>JMP label000032EF
+</span><span style="color:#555555;">/*  &lt;....&gt;  */
+</span></code></pre>
+<p>Our solution is ready to be implemented and for that we would need an assembler (had to write that too). The result is single script file <code>shake.script</code> that should be copied to “<code>&lt;game_root&gt;/scenes/bunker</code>” replacing the old one. Quick testing proved it works, the sprite object pointer is always valid and game no longer crashes inside a bunker.</p>
+<p>At least not because of this problem. If there’s some other game breaking issue — let the world know, someone will fix it… eventually.</p>
+<h2 id="links">Links<a class="heading-anchor" href="#links" aria-label="Anchor link for: links">&#128279;</a></h2>
+<p>All tools created as a part of this article are written in <code>C#</code> (.NET 6) and released into <strong>Public Domain</strong>.</p>
+<p>Wintermute Engine script <em>disassembler</em>/<em>assembler</em> and dcp package file <em>extractor</em> source code (in a single file): <a href="/fixing-a-fourteen-years-old-bug/Summerloud.cs">Summerloud.cs</a></p>
+<p>To build copy <code>Summerloud.cs</code> file into an empty folder then run following commands inside that folder (assuming <em>dotnet sdk</em> is installed):</p>
+<pre data-lang="Bash" style="background-color:#ffffff;color:#202020;" class="language-Bash "><code class="language-Bash" data-lang="Bash"><span style="color:#555555;"># Step 1: create a new .NET console project
+</span><span>dotnet new console
+</span><span style="color:#555555;"># Step 2: replace default Program.cs with Summerloud.cs
+</span><span style="color:#555555;"># On windows: move /Y Summerloud.cs Program.cs
+</span><span>mv -f Summerloud.cs Program.cs
+</span><span style="color:#555555;"># Step 3: build project
+</span><span>dotnet build
+</span></code></pre>
+<p>Download fix: <a href="/fixing-a-fourteen-years-old-bug/shake.script">shake.script</a></p>
+
+    </section>
+
+    
+    <footer class="article-info">
+        <div class="article-date">
+            <time datetime="2023-04-09"> 9 April 2023</time>&nbsp;<time datetime="2023-04-25">(last updated: 25 April 2023)</time>
+        </div>
+        <div class="article-taxonomies">
+            <ul class="article-categories"><li>Bug fixes</li></ul>
+            <ul class="article-tags"><li>#Reverse engineering</li><li>#A Stroke of Fate</li><li>#Operation Bunker</li><li>#Crash</li></ul>
+        </div>
+    </footer>
+
+</article>
+
+
+        </main>
+        <footer>
+            <div class="footer">
+                <small>&copy; 2023 AdM244</small>
+                <small>Generated with <a href="https://www.getzola.org">Zola</a></small>
+            </div>
+        </footer>
+    </div>
+</body>
+</html>
